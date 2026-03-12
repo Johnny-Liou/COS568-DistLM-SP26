@@ -1,0 +1,340 @@
+# coding=utf-8
+# Task 4 (based on Task 3): Profiling DDP gradient synchronization
+
+from __future__ import absolute_import, division, print_function
+
+import argparse
+import logging
+import os
+import random
+import time
+
+import numpy as np
+import torch
+import torch.profiler
+import torch.nn.parallel
+from torch.utils.data import (DataLoader, SequentialSampler, TensorDataset)
+from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm, trange
+
+from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
+                                  BertForSequenceClassification, BertTokenizer,
+                                  RobertaConfig,
+                                  RobertaForSequenceClassification,
+                                  RobertaTokenizer,
+                                  XLMConfig, XLMForSequenceClassification,
+                                  XLMTokenizer, XLNetConfig,
+                                  XLNetForSequenceClassification,
+                                  XLNetTokenizer)
+from pytorch_transformers import AdamW, WarmupLinearSchedule
+
+from utils_glue import (compute_metrics, convert_examples_to_features,
+                        output_modes, processors)
+
+logger = logging.getLogger(__name__)
+
+ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in (BertConfig, XLNetConfig, XLMConfig, RobertaConfig)), ())
+
+MODEL_CLASSES = {
+    'bert': (BertConfig, BertForSequenceClassification, BertTokenizer),
+    'xlnet': (XLNetConfig, XLNetForSequenceClassification, XLNetTokenizer),
+    'xlm': (XLMConfig, XLMForSequenceClassification, XLMTokenizer),
+    'roberta': (RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer),
+}
+
+
+def set_seed(args):
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.cuda.manual_seed_all(args.seed)
+
+
+def train(args, train_dataset, model, tokenizer):
+    """ Train the model """
+
+    args.train_batch_size = args.per_device_train_batch_size
+    train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.local_rank)
+    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+
+    if args.max_steps > 0:
+        t_total = args.max_steps
+        args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
+    else:
+        t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
+
+    no_decay = ['bias', 'LayerNorm.weight']
+    optimizer_grouped_parameters = [
+        {'params': [p for n, p in model.module.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
+        {'params': [p for n, p in model.module.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+    ]
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
+
+    logger.info("***** Running training (Task 4 / 3: DDP + profiling) *****")
+    logger.info("  Num examples = %d", len(train_dataset))
+    logger.info("  Per-device batch size = %d", args.per_device_train_batch_size)
+    logger.info("  Total batch size = %d", args.train_batch_size * args.world_size)
+    logger.info("  World size = %d", args.world_size)
+
+    global_step = 0
+    tr_loss = 0.0
+    model.zero_grad()
+    set_seed(args)
+
+    # Profiler: skip step 0 (wait=1), then record steps 1-3 (active=3)
+    trace_dir = os.path.join(args.output_dir, f"trace_3_rank{args.local_rank}")
+    os.makedirs(trace_dir, exist_ok=True)
+
+    prof_schedule = torch.profiler.schedule(wait=1, warmup=0, active=3, repeat=1)
+
+    with torch.profiler.profile(
+        schedule=prof_schedule,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(trace_dir),
+        record_shapes=True,
+        with_stack=True,
+    ) as prof:
+        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank != 0)
+        for step, batch in enumerate(epoch_iterator):
+            model.train()
+
+            batch = tuple(t.to(args.device) for t in batch)
+            inputs = {'input_ids':      batch[0],
+                      'attention_mask': batch[1],
+                      'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
+                      'labels':         batch[3]}
+            outputs = model(**inputs)
+            loss = outputs[0]
+
+            if args.gradient_accumulation_steps > 1:
+                loss = loss / args.gradient_accumulation_steps
+
+            # DDP automatically synchronizes gradients during backward()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+            tr_loss += loss.item()
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                optimizer.step()
+                scheduler.step()
+                model.zero_grad()
+                global_step += 1
+
+            print(f"[Rank {args.local_rank}] Step {step}, Loss: {loss.item():.4f}")
+
+            # Advance the profiler schedule by one step
+            prof.step()
+
+            # Stop after 4 steps total (step 0 skipped + steps 1-3 profiled)
+            if step >= 3:
+                break
+
+    logger.info("Profiling complete. Trace saved to: %s", trace_dir)
+    return global_step, tr_loss / max(global_step, 1)
+
+
+def evaluate(args, model, tokenizer, prefix=""):
+    eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
+    eval_outputs_dirs = (args.output_dir, args.output_dir + '-MM') if args.task_name == "mnli" else (args.output_dir,)
+
+    results = {}
+    for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
+        eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, evaluate=True)
+
+        if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
+            os.makedirs(eval_output_dir)
+
+        args.eval_batch_size = args.per_device_eval_batch_size
+        eval_sampler = SequentialSampler(eval_dataset)
+        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+
+        logger.info("***** Running evaluation {} *****".format(prefix))
+        eval_loss = 0.0
+        nb_eval_steps = 0
+        preds = None
+        out_label_ids = None
+
+        for batch in tqdm(eval_dataloader, desc="Evaluating"):
+            model.eval()
+            batch = tuple(t.to(args.device) for t in batch)
+            with torch.no_grad():
+                inputs = {'input_ids':      batch[0],
+                          'attention_mask': batch[1],
+                          'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
+                          'labels':         batch[3]}
+                outputs = model(**inputs)
+                tmp_eval_loss, logits = outputs[:2]
+                eval_loss += tmp_eval_loss.mean().item()
+            nb_eval_steps += 1
+            if preds is None:
+                preds = logits.detach().cpu().numpy()
+                out_label_ids = inputs['labels'].detach().cpu().numpy()
+            else:
+                preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
+                out_label_ids = np.append(out_label_ids, inputs['labels'].detach().cpu().numpy(), axis=0)
+
+        eval_loss = eval_loss / nb_eval_steps
+        if args.output_mode == "classification":
+            preds = np.argmax(preds, axis=1)
+        elif args.output_mode == "regression":
+            preds = np.squeeze(preds)
+        result = compute_metrics(eval_task, preds, out_label_ids)
+        results.update(result)
+
+        output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
+        with open(output_eval_file, "w") as writer:
+            logger.info("***** Eval results {} *****".format(prefix))
+            for key in sorted(result.keys()):
+                logger.info("  %s = %s", key, str(result[key]))
+                writer.write("%s = %s\n" % (key, str(result[key])))
+
+    return results
+
+
+def load_and_cache_examples(args, task, tokenizer, evaluate=False):
+    if args.local_rank not in [-1, 0]:
+        torch.distributed.barrier()
+
+    processor = processors[task]()
+    output_mode = output_modes[task]
+    cached_features_file = os.path.join(args.data_dir, 'cached_{}_{}_{}_{}'.format(
+        'dev' if evaluate else 'train',
+        list(filter(None, args.model_name_or_path.split('/'))).pop(),
+        str(args.max_seq_length),
+        str(task)))
+
+    if os.path.exists(cached_features_file):
+        logger.info("Loading features from cached file %s", cached_features_file)
+        features = torch.load(cached_features_file)
+    else:
+        logger.info("Creating features from dataset file at %s", args.data_dir)
+        label_list = processor.get_labels()
+        if task in ['mnli', 'mnli-mm'] and args.model_type in ['roberta']:
+            label_list[1], label_list[2] = label_list[2], label_list[1]
+        examples = processor.get_dev_examples(args.data_dir) if evaluate else processor.get_train_examples(args.data_dir)
+        features = convert_examples_to_features(examples, label_list, args.max_seq_length, tokenizer, output_mode,
+            cls_token_at_end=bool(args.model_type in ['xlnet']),
+            cls_token=tokenizer.cls_token,
+            cls_token_segment_id=2 if args.model_type in ['xlnet'] else 0,
+            sep_token=tokenizer.sep_token,
+            sep_token_extra=bool(args.model_type in ['roberta']),
+            pad_on_left=bool(args.model_type in ['xlnet']),
+            pad_token=tokenizer.convert_tokens_to_ids([tokenizer.pad_token])[0],
+            pad_token_segment_id=4 if args.model_type in ['xlnet'] else 0,
+        )
+        if args.local_rank in [-1, 0]:
+            logger.info("Saving features into cached file %s", cached_features_file)
+            torch.save(features, cached_features_file)
+
+    if args.local_rank == 0:
+        torch.distributed.barrier()
+
+    all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
+    all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
+    all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
+    if output_mode == "classification":
+        all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.long)
+    elif output_mode == "regression":
+        all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.float)
+
+    dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
+    return dataset
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--data_dir", default=None, type=str, required=True)
+    parser.add_argument("--model_type", default=None, type=str, required=True)
+    parser.add_argument("--model_name_or_path", default=None, type=str, required=True)
+    parser.add_argument("--task_name", default=None, type=str, required=True)
+    parser.add_argument("--output_dir", default=None, type=str, required=True)
+    parser.add_argument("--config_name", default="", type=str)
+    parser.add_argument("--tokenizer_name", default="", type=str)
+    parser.add_argument("--cache_dir", default="", type=str)
+    parser.add_argument("--max_seq_length", default=128, type=int)
+    parser.add_argument("--do_train", action='store_true')
+    parser.add_argument("--do_eval", action='store_true')
+    parser.add_argument("--do_lower_case", action='store_true')
+    parser.add_argument("--per_device_train_batch_size", default=8, type=int)
+    parser.add_argument("--per_device_eval_batch_size", default=8, type=int)
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
+    parser.add_argument("--learning_rate", default=5e-5, type=float)
+    parser.add_argument("--weight_decay", default=0.0, type=float)
+    parser.add_argument("--adam_epsilon", default=1e-8, type=float)
+    parser.add_argument("--max_grad_norm", default=1.0, type=float)
+    parser.add_argument("--num_train_epochs", default=3.0, type=float)
+    parser.add_argument("--max_steps", default=-1, type=int)
+    parser.add_argument("--warmup_steps", default=0, type=int)
+    parser.add_argument("--no_cuda", action='store_true')
+    parser.add_argument('--overwrite_output_dir', action='store_true')
+    parser.add_argument('--overwrite_cache', action='store_true')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--fp16', action='store_true')
+    parser.add_argument('--fp16_opt_level', type=str, default='O1')
+    parser.add_argument("--local_rank", type=int, default=0)
+    parser.add_argument("--master_ip", type=str, default="127.0.0.1")
+    parser.add_argument("--master_port", type=str, default="12345")
+    parser.add_argument("--world_size", type=int, default=1)
+
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    torch.distributed.init_process_group(
+        backend='gloo',
+        init_method=f"tcp://{args.master_ip}:{args.master_port}",
+        world_size=args.world_size,
+        rank=args.local_rank,
+    )
+
+    args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    args.n_gpu = torch.cuda.device_count()
+
+    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+                        datefmt='%m/%d/%Y %H:%M:%S',
+                        level=logging.INFO if args.local_rank == 0 else logging.WARN)
+
+    set_seed(args)
+
+    args.task_name = args.task_name.lower()
+    processor = processors[args.task_name]()
+    args.output_mode = output_modes[args.task_name]
+    label_list = processor.get_labels()
+    num_labels = len(label_list)
+
+    if args.local_rank != 0:
+        torch.distributed.barrier()
+
+    args.model_type = args.model_type.lower()
+    config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+    config = config_class.from_pretrained(
+        args.config_name if args.config_name else args.model_name_or_path,
+        num_labels=num_labels, finetuning_task=args.task_name)
+    tokenizer = tokenizer_class.from_pretrained(
+        args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
+        do_lower_case=args.do_lower_case)
+    model = model_class.from_pretrained(args.model_name_or_path, config=config)
+
+    if args.local_rank == 0:
+        torch.distributed.barrier()
+
+    model.to(args.device)
+
+    # Wrap model with DistributedDataParallel — gradient sync is automatic during backward()
+    model = torch.nn.parallel.DistributedDataParallel(model)
+
+    if args.do_train:
+        train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
+        global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+        logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
+
+    # Only rank 0 runs evaluation; unwrap DDP module first
+    if args.local_rank == 0 and args.do_eval:
+        evaluate(args, model.module, tokenizer, prefix="")
+
+
+if __name__ == "__main__":
+    main()
