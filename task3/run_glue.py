@@ -56,7 +56,7 @@ def train(args, train_dataset, model, tokenizer):
 
     args.train_batch_size = args.per_device_train_batch_size
     # Use DistributedSampler to partition data across workers
-    train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.local_rank)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.local_rank, seed=args.seed)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
     if args.max_steps > 0:
@@ -86,7 +86,8 @@ def train(args, train_dataset, model, tokenizer):
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank != 0)
     set_seed(args)
 
-    for _ in train_iterator:
+    for epoch in train_iterator:
+        train_sampler.set_epoch(epoch)
         iter_times = []
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank != 0)
         for step, batch in enumerate(epoch_iterator):
