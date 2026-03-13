@@ -115,10 +115,10 @@ def train(args, train_dataset, model, tokenizer):
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
 
+            loss.backward()
             # Gradient synchronization via all_reduce
             sync_gradients_all_reduce(model, args)
 
-            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
