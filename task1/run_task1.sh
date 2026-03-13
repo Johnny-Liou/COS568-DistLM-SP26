@@ -1,6 +1,6 @@
 export GLUE_DIR=$HOME/COS568-DistLM-SP26/glue_data
 export TASK_NAME=RTE
-export GLOO_SOCKET_IFNAME=enp1s0d1
+export GLOO_SOCKET_IFNAME=enp65s0f0np0
 
 python3 run_glue.py \
   --model_type bert \
