@@ -114,6 +114,9 @@ def train(args, train_dataset, model, tokenizer):
     # Counter for recording first 5 minibatches
     minibatch_count = 0
     loss_log_file = os.path.join(args.output_dir, "minibatch_losses.txt")
+    # Ensure output directory exists
+    if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
+        os.makedirs(args.output_dir)
     
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
