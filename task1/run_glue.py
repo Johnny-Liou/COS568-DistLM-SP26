@@ -110,6 +110,11 @@ def train(args, train_dataset, model, tokenizer):
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
+    
+    # Counter for recording first 5 minibatches
+    minibatch_count = 0
+    loss_log_file = os.path.join(args.output_dir, "minibatch_losses.txt")
+    
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
@@ -137,6 +142,14 @@ def train(args, train_dataset, model, tokenizer):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
+            
+            # Record loss of first 5 minibatches
+            if minibatch_count < 5:
+                with open(loss_log_file, "a") as writer:
+                    writer.write("Minibatch %d: loss = %f\n" % (minibatch_count, loss.item()))
+                logger.info("Minibatch %d: loss = %f", minibatch_count, loss.item())
+                minibatch_count += 1
+            
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 ##################################################
                 # TODO(cos568): perform a single optimization step (parameter update) by invoking the optimizer (expect one line of code)
@@ -216,7 +229,7 @@ def evaluate(args, model, tokenizer, prefix=""):
         results.update(result)
 
         output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
-        with open(output_eval_file, "w") as writer:
+        with open(output_eval_file, "a") as writer:
             logger.info("***** Eval results {} *****".format(prefix))
             for key in sorted(result.keys()):
                 logger.info("  %s = %s", key, str(result[key]))
