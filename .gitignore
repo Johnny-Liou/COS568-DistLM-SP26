@@ -1,6 +1,4 @@
 /__pycache__
 *.out
 /glue_data/
-/results_old/
 /*/__pycache__
-/results/task4/*
