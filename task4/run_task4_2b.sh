@@ -1,11 +1,5 @@
 #!/bin/bash
 # Task 4: Profiling all_reduce (based on Task 2b)
-# Master node is node3 (IP: 10.10.1.1), which runs with --local_rank 0
-# Run this script on EACH node with the correct --local_rank:
-#   node3 (10.10.1.1): bash run_task4_2b.sh 0   ← master / rank 0
-#   node0 (10.10.1.2): bash run_task4_2b.sh 1
-#   node1 (10.10.1.x): bash run_task4_2b.sh 2
-#   node2 (10.10.1.x): bash run_task4_2b.sh 3
 
 export GLUE_DIR=$HOME/COS568-DistLM-SP26/glue_data
 export TASK_NAME=RTE

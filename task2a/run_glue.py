@@ -60,25 +60,25 @@ def sync_gradients_gather_scatter(model, args):
             continue
         grad = param.grad.data
 
-        # Step 1: rank 0 gathers gradients from all workers
+        # Rank 0 gathers gradients from all workers
         if rank == 0:
             gather_list = [torch.zeros_like(grad) for _ in range(world_size)]
         else:
             gather_list = None
         torch.distributed.gather(grad, gather_list=gather_list, dst=0)
 
-        # Step 2: rank 0 averages and prepares scatter list
+        # Rank 0 averages and prepares scatter list
         if rank == 0:
             avg_grad = torch.mean(torch.stack(gather_list), dim=0)
             scatter_list = [avg_grad.clone() for _ in range(world_size)]
         else:
             scatter_list = None
 
-        # Step 3: rank 0 scatters the averaged gradient back to all workers
+        # Rank 0 scatters the averaged gradient back to all workers
         result = torch.zeros_like(grad)
         torch.distributed.scatter(result, scatter_list=scatter_list, src=0)
 
-        # Step 4: update the gradient with the averaged value
+        # Update the gradient with the averaged value
         param.grad.data = result
 
 

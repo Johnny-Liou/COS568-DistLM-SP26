@@ -105,7 +105,6 @@ def train(args, train_dataset, model, tokenizer):
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
 
-            # DDP automatically synchronizes gradients during backward()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
@@ -343,7 +342,7 @@ def main():
 
     model.to(args.device)
 
-    # Wrap model with DistributedDataParallel — gradient sync is automatic during backward()
+    # Wrap model with DistributedDataParallel
     model = torch.nn.parallel.DistributedDataParallel(model)
 
     logger.info("Training/evaluation parameters %s", args)

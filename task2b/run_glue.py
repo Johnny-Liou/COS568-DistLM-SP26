@@ -51,13 +51,11 @@ def set_seed(args):
 
 
 def sync_gradients_all_reduce(model, args):
-    """Aggregate gradients across all workers using all_reduce (sum), then divide by world_size."""
     for param in model.parameters():
         if param.grad is None:
             continue
         # Sum gradients across all workers in-place
         torch.distributed.all_reduce(param.grad.data, op=torch.distributed.ReduceOp.SUM)
-        # Divide to get the mean
         param.grad.data /= args.world_size
 
 

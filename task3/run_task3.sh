@@ -1,15 +1,9 @@
 #!/bin/bash
 # Task 3: Distributed training with DistributedDataParallel (DDP)
-# Master node is node3 (IP: 10.10.1.1), which runs with --local_rank 0
-# Run this script on EACH node with the correct --local_rank:
-#   node3 (10.10.1.1): bash run_task3.sh 0   ← master / rank 0
-#   node0 (10.10.1.2): bash run_task3.sh 1
-#   node1 (10.10.1.x): bash run_task3.sh 2
-#   node2 (10.10.1.x): bash run_task3.sh 3
 
 export GLUE_DIR=$HOME/COS568-DistLM-SP26/glue_data
 export TASK_NAME=RTE
-export GLOO_SOCKET_IFNAME=enp65s0f0np0   # CloudLab experimental network interface
+export GLOO_SOCKET_IFNAME=enp65s0f0np0 
 
 LOCAL_RANK=${1:-0}   # first argument is the rank of this node
 
